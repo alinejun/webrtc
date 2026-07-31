@@ -23,7 +23,7 @@ use bytes::BytesMut;
 use futures::FutureExt; // For .fuse() in futures::select!
 use futures::future::OptionFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{error, trace, warn};
+use log::{debug, error, trace, warn};
 use rtc::ice::candidate::Candidate;
 use rtc::interceptor::{Interceptor, NoopInterceptor};
 use rtc::mdns::MDNS_PORT;
@@ -71,6 +71,16 @@ pub(crate) enum PeerConnectionDriverEvent {
         ice_transport_policy: RTCIceTransportPolicy,
     },
     IceGathering,
+    /// A datagram received on a dedicated relay socket.  Each relay candidate
+    /// binds its own ephemeral socket (pion-style), and a per-socket read task
+    /// forwards datagrams here so the core UDP read loop need not manage
+    /// dynamically-added sockets.  Carried as parts (not `TaggedBytesMut`) so
+    /// the enum can stay `Debug`.
+    RelayPacket {
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        message: BytesMut,
+    },
     Close,
 }
 
@@ -94,6 +104,11 @@ where
     stun_gathering_complete: bool,
     turn_gathering_complete: bool,
     pending_ice_configuration: Option<(Vec<RTCIceServer>, RTCIceTransportPolicy)>,
+    /// Dedicated relay sockets bound for the current gathering round, with the
+    /// read task that forwards each socket's datagrams into
+    /// [`PeerConnectionDriverEvent::RelayPacket`].  Torn down and re-bound on
+    /// every gather so each relay allocation uses a fresh 5-tuple.
+    relay_socket_tasks: Vec<(SocketAddr, crate::runtime::JoinHandle)>,
 }
 
 impl<I> PeerConnectionDriver<I>
@@ -125,6 +140,7 @@ where
             stun_gathering_complete: false,
             turn_gathering_complete: false,
             pending_ice_configuration: None,
+            relay_socket_tasks: Vec::new(),
         })
     }
 
@@ -229,6 +245,7 @@ where
             // momentarily full channel), this check still guarantees the loop —
             // and thus a dedicated reactor thread — terminates instead of leaking.
             if self.inner.closing.load(Ordering::Acquire) {
+                self.teardown_relay_sockets();
                 if let Err(err) = self.turn_relayer.close() {
                     error!("Failed to close turn_relayer: {}", err);
                 }
@@ -891,14 +908,17 @@ where
                 self.pending_ice_configuration = Some((ice_servers, ice_transport_policy));
             }
             PeerConnectionDriverEvent::IceGathering => {
-                if let Some((ice_servers, ice_transport_policy)) =
+                let config_changed = if let Some((ice_servers, ice_transport_policy)) =
                     self.pending_ice_configuration.take()
                 {
                     self.stun_gatherer
                         .update_configuration(ice_servers.clone(), ice_transport_policy);
                     self.turn_relayer
                         .update_configuration(ice_servers, ice_transport_policy);
-                }
+                    true
+                } else {
+                    false
+                };
 
                 self.ice_gathering_active = true;
                 self.stun_gathering_complete = false;
@@ -926,6 +946,29 @@ where
                 {
                     error!("Failed to gather ice gathering: {}", err);
                 }
+
+                // Pion-style fresh relay socket per gather, but only when there
+                // is a TURN server to allocate from AND a fresh gather will
+                // actually re-allocate (the configuration changed, resetting the
+                // relayer, or no relay socket exists yet).  On host-only configs
+                // there are no relay candidates, so no extra sockets are created
+                // at all.  Rebinding on every IceGathering would tear down a
+                // socket whose allocation is still in flight (IceGathering can
+                // fire several times per restart) — the failure this avoids.
+                if self.turn_relayer.uses_turn() {
+                    if config_changed || self.relay_socket_tasks.is_empty() {
+                        self.teardown_relay_sockets();
+                        match self.bind_relay_sockets() {
+                            Ok(addrs) => self.turn_relayer.set_relay_bind_addrs(addrs),
+                            Err(err) => error!("Failed to bind relay sockets: {}", err),
+                        }
+                    }
+                } else {
+                    // Host-only: no relay candidates; ensure no relay sockets
+                    // linger from a previous TURN-enabled configuration.
+                    self.teardown_relay_sockets();
+                }
+
                 if self.turn_relayer.state() != RTCIceGatheringState::Gathering
                     && let Err(err) = self.turn_relayer.gather().await
                 {
@@ -943,7 +986,30 @@ where
                 trace!("TCP stream connection established: {:?}", four_tuple);
                 self.tcp_transport.register_stream(four_tuple, stream);
             }
+            PeerConnectionDriverEvent::RelayPacket {
+                local_addr,
+                peer_addr,
+                message,
+            } => {
+                // Datagram received on a dedicated relay socket; rebuild the
+                // transport message and feed it to the TURN relayer, which
+                // routes it by 4-tuple to the owning client.
+                let msg = TaggedBytesMut {
+                    now: Instant::now(),
+                    transport: TransportContext {
+                        local_addr,
+                        peer_addr,
+                        ecn: None,
+                        transport_protocol: TransportProtocol::UDP,
+                    },
+                    message,
+                };
+                if let Err(err) = self.turn_relayer.handle_read(msg) {
+                    trace!("relay packet handle_read: {}", err);
+                }
+            }
             PeerConnectionDriverEvent::Close => {
+                self.teardown_relay_sockets();
                 if let Err(err) = self.turn_relayer.close() {
                     error!("Failed to close turn_relayer: {}", err);
                 }
@@ -952,6 +1018,66 @@ where
         }
 
         false
+    }
+
+    /// Tear down the dedicated relay sockets bound for the previous gathering
+    /// round: abort their read tasks and drop them from the write path.
+    fn teardown_relay_sockets(&mut self) {
+        for (local_addr, handle) in self.relay_socket_tasks.drain(..) {
+            debug!("relay socket torn down: {}", local_addr);
+            handle.abort();
+            self.udp_sockets.remove(&local_addr);
+        }
+    }
+
+    /// Bind one fresh ephemeral UDP socket per shared local interface for the
+    /// relay candidates of the upcoming gathering round (pion-style: every
+    /// relay gather allocates on a fresh 5-tuple, so a re-allocation never
+    /// collides with a prior allocation on the server).  Each socket is
+    /// registered in the write path (`udp_sockets`) and given a read task that
+    /// forwards its datagrams into the event loop as `RelayPacket`s.  Returns
+    /// the bound local addresses for the relayer to allocate from.
+    fn bind_relay_sockets(&mut self) -> Result<Vec<SocketAddr>> {
+        // Bind on the same interface IPs as the shared sockets, but a fresh
+        // ephemeral port each — a new 5-tuple per gather.
+        let bind_ips: Vec<std::net::IpAddr> = self.udp_sockets.keys().map(|a| a.ip()).collect();
+        let mut bound = Vec::with_capacity(bind_ips.len());
+        for ip in bind_ips {
+            let std_socket = std::net::UdpSocket::bind(SocketAddr::new(ip, 0))?;
+            std_socket.set_nonblocking(true)?;
+            let socket = self.inner.runtime.wrap_udp_socket(std_socket)?;
+            let local_addr = socket.local_addr()?;
+
+            let tx = self.inner.driver_event_tx.clone();
+            let task_socket = socket.clone();
+            let handle = self.inner.runtime.spawn(Box::pin(async move {
+                let mut buf = vec![0u8; 2048];
+                loop {
+                    match task_socket.recv_from(&mut buf).await {
+                        Ok((n, peer_addr)) => {
+                            if tx
+                                .send(PeerConnectionDriverEvent::RelayPacket {
+                                    local_addr,
+                                    peer_addr,
+                                    message: BytesMut::from(&buf[..n]),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break; // driver event loop is gone
+                            }
+                        }
+                        Err(_) => break, // socket closed
+                    }
+                }
+            }));
+
+            self.udp_sockets.insert(local_addr, socket);
+            self.relay_socket_tasks.push((local_addr, handle));
+            bound.push(local_addr);
+        }
+        debug!("relay sockets bound for gather: {:?}", bound);
+        Ok(bound)
     }
 
     async fn populate_track_remote_codings(

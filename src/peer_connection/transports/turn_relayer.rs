@@ -50,6 +50,12 @@ struct ManagedTurnClient {
 
 pub(crate) struct RTCTurnRelayer {
     local_addrs: Vec<SocketAddr>,
+    /// Dedicated relay bind addresses supplied by the driver for the current
+    /// gathering round.  When non-empty these take precedence over
+    /// `local_addrs` so each relay gather binds a fresh ephemeral socket (a new
+    /// 5-tuple), matching pion's per-gather relay socket and avoiding a
+    /// same-5-tuple re-Allocate that the server would reject with 437.
+    relay_bind_addrs: Vec<SocketAddr>,
     ice_servers: Vec<RTCIceServer>,
     ice_gather_policy: RTCIceTransportPolicy,
     state: RTCIceGatheringState,
@@ -71,6 +77,7 @@ impl RTCTurnRelayer {
     ) -> Self {
         Self {
             local_addrs,
+            relay_bind_addrs: Vec::new(),
             ice_servers,
             ice_gather_policy,
             state: RTCIceGatheringState::New,
@@ -83,6 +90,31 @@ impl RTCTurnRelayer {
             routs: VecDeque::new(),
             events: VecDeque::new(),
         }
+    }
+
+    /// Set the dedicated relay bind addresses for the next gathering round.
+    ///
+    /// The driver binds a fresh ephemeral UDP socket per address before each
+    /// gather and passes their local addresses here; [`Self::gather`] then
+    /// allocates each relay candidate on its own fresh 5-tuple.
+    pub(crate) fn set_relay_bind_addrs(&mut self, addrs: Vec<SocketAddr>) {
+        self.relay_bind_addrs = addrs;
+    }
+
+    /// Whether the current configuration includes any usable TURN-over-UDP
+    /// server.  The driver only binds dedicated relay sockets when this is
+    /// true; on host-only configurations there are no relay candidates to
+    /// allocate, so no extra sockets should be created.
+    pub(crate) fn uses_turn(&self) -> bool {
+        self.ice_servers.iter().any(|ice_server| {
+            ice_server.urls().is_ok_and(|urls| {
+                urls.iter().any(|url| {
+                    matches!(url.scheme, SchemeType::Turn | SchemeType::Turns)
+                        && !url.is_secure()
+                        && url.proto.to_string() == "udp"
+                })
+            })
+        })
     }
 
     pub(crate) fn state(&self) -> RTCIceGatheringState {
@@ -132,6 +164,15 @@ impl RTCTurnRelayer {
 
         self.state = RTCIceGatheringState::Gathering;
 
+        // Pion-style per-gather relay socket: allocate each relay candidate on
+        // the driver's dedicated fresh relay sockets when supplied, else fall
+        // back to the shared local addresses (pre-existing behavior).
+        let bind_addrs: Vec<SocketAddr> = if self.relay_bind_addrs.is_empty() {
+            self.local_addrs.clone()
+        } else {
+            self.relay_bind_addrs.clone()
+        };
+
         for ice_server in &self.ice_servers {
             let urls = ice_server.urls()?;
 
@@ -162,7 +203,7 @@ impl RTCTurnRelayer {
                     }
                 };
 
-                for local_addr in &self.local_addrs {
+                for local_addr in &bind_addrs {
                     let Some(peer_addr) = resolved_addrs
                         .iter()
                         .copied()
