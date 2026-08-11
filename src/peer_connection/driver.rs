@@ -158,9 +158,7 @@ pub(crate) enum PeerConnectionDriverEvent {
         ice_servers: Vec<RTCIceServer>,
         ice_transport_policy: RTCIceTransportPolicy,
     },
-    IceGathering {
-        rebind_udp_sockets: bool,
-    },
+    IceGathering,
     Close,
 }
 
@@ -177,7 +175,6 @@ where
     tcp_transport: RTCTcpTransport,
     mdns_socket: Option<Arc<dyn AsyncUdpSocket>>,
     udp_sockets: HashMap<SocketAddr, Arc<dyn AsyncUdpSocket>>,
-    udp_bind_addrs: Vec<SocketAddr>,
     /// Reused scratch buffer for concatenating a run of same-destination datagrams
     /// into one UDP GSO send (see [`flush_writes`](Self::flush_writes)).
     gso_scratch: Vec<u8>,
@@ -198,7 +195,6 @@ where
         turn_relayer: RTCTurnRelayer,
         mdns_socket: Option<Arc<dyn AsyncUdpSocket>>,
         udp_sockets: HashMap<SocketAddr, Arc<dyn AsyncUdpSocket>>,
-        udp_bind_addrs: Vec<SocketAddr>,
         tcp_listeners: HashMap<SocketAddr, Arc<dyn AsyncTcpListener>>,
     ) -> Result<Self> {
         if udp_sockets.is_empty() && tcp_listeners.is_empty() {
@@ -211,7 +207,6 @@ where
             turn_relayer,
             mdns_socket,
             udp_sockets,
-            udp_bind_addrs,
             gso_scratch: Vec::new(),
             tcp_transport: RTCTcpTransport::new(tcp_listeners),
             ice_gathering_active: false,
@@ -219,23 +214,6 @@ where
             turn_gathering_complete: false,
             pending_ice_configuration: None,
         })
-    }
-
-    fn rebind_udp_sockets(&mut self) -> Result<()> {
-        let mut udp_sockets = HashMap::with_capacity(self.udp_bind_addrs.len());
-        for bind_addr in &self.udp_bind_addrs {
-            let socket = std::net::UdpSocket::bind(bind_addr)?;
-            socket.set_nonblocking(true)?;
-            let local_addr = socket.local_addr()?;
-            udp_sockets.insert(local_addr, self.inner.runtime.wrap_udp_socket(socket)?);
-        }
-
-        let local_addrs = udp_sockets.keys().copied().collect::<Vec<_>>();
-        self.stun_gatherer
-            .restart_with_local_addrs(local_addrs.clone());
-        self.turn_relayer.restart_with_local_addrs(local_addrs);
-        self.udp_sockets = udp_sockets;
-        Ok(())
     }
 
     /// Mark the connection closing and wake any sender parked in send back-pressure.
@@ -278,7 +256,7 @@ where
         mut driver_event_rx: Receiver<PeerConnectionDriverEvent>,
     ) -> Result<()> {
         // Collect socket info into a vec for indexed access
-        let mut udp_socket_list: Vec<(SocketAddr, Arc<dyn AsyncUdpSocket>)> = self
+        let udp_socket_list: Vec<(SocketAddr, Arc<dyn AsyncUdpSocket>)> = self
             .udp_sockets
             .iter()
             .map(|(addr, sock)| (*addr, sock.clone()))
@@ -432,39 +410,36 @@ where
                 delay_from_now
             };
 
-            let mut deferred_driver_event = None;
-            {
-                let timer = self.inner.runtime.sleep(delay_from_now);
-                futures::pin_mut!(timer);
+            let timer = self.inner.runtime.sleep(delay_from_now);
+            futures::pin_mut!(timer);
 
-                let udp_recv_future: OptionFuture<_> = if !udp_recv_futures.is_empty() {
-                    Some(udp_recv_futures.next())
+            let udp_recv_future: OptionFuture<_> = if !udp_recv_futures.is_empty() {
+                Some(udp_recv_futures.next())
+            } else {
+                None
+            }
+            .into();
+            futures::pin_mut!(udp_recv_future);
+
+            let tcp_accept_future: OptionFuture<_> =
+                if !self.tcp_transport.accept_futures.is_empty() {
+                    Some(self.tcp_transport.accept_futures.next())
                 } else {
                     None
                 }
                 .into();
-                futures::pin_mut!(udp_recv_future);
+            futures::pin_mut!(tcp_accept_future);
 
-                let tcp_accept_future: OptionFuture<_> =
-                    if !self.tcp_transport.accept_futures.is_empty() {
-                        Some(self.tcp_transport.accept_futures.next())
-                    } else {
-                        None
-                    }
-                    .into();
-                futures::pin_mut!(tcp_accept_future);
+            let tcp_read_future: OptionFuture<_> = if !self.tcp_transport.read_futures.is_empty() {
+                Some(self.tcp_transport.read_futures.next())
+            } else {
+                None
+            }
+            .into();
+            futures::pin_mut!(tcp_read_future);
 
-                let tcp_read_future: OptionFuture<_> =
-                    if !self.tcp_transport.read_futures.is_empty() {
-                        Some(self.tcp_transport.read_futures.next())
-                    } else {
-                        None
-                    }
-                    .into();
-                futures::pin_mut!(tcp_read_future);
-
-                // Runtime-agnostic select!
-                futures::select! {
+            // Runtime-agnostic select!
+            futures::select! {
                 // Timer expired
                 _ = timer.fuse() => {
                     self.handle_timeout(Instant::now()).await?;
@@ -473,21 +448,10 @@ where
                 // Driver events (RTP, RTCP, or ICE candidate)
                 evt = driver_event_rx.recv().fuse() => {
                     if let Some(evt) = evt {
-                        if matches!(
-                            evt,
-                            PeerConnectionDriverEvent::IceGathering {
-                                rebind_udp_sockets: true
-                            }
-                        ) {
-                            // The receive futures borrow the current socket set. Defer
-                            // replacement until this select scope has dropped those borrows.
-                            deferred_driver_event = Some(evt);
-                        } else {
-                            let is_closed = self.handle_driver_event(evt).await;
-                            if is_closed {
-                                trace!("Driver event channel closed, exiting event loop");
-                                return Ok(());
-                            }
+                        let is_closed = self.handle_driver_event(evt).await;
+                        if is_closed {
+                            trace!("Driver event channel closed, exiting event loop");
+                            return Ok(());
                         }
                     }
                 }
@@ -617,55 +581,6 @@ where
                             }
                         }
                     }
-                }
-                }
-            }
-
-            if let Some(evt) = deferred_driver_event {
-                // Drop every reference to the old sockets before rebinding. This
-                // also permits callers that configured fixed ports to reclaim the
-                // same address, while `:0` bindings receive a fresh ephemeral port.
-                udp_recv_futures.clear();
-                udp_socket_list.clear();
-                self.udp_sockets.clear();
-                self.rebind_udp_sockets()?;
-
-                udp_socket_list = self
-                    .udp_sockets
-                    .iter()
-                    .map(|(addr, sock)| (*addr, sock.clone()))
-                    .chain(self.mdns_socket.iter().filter_map(|socket| {
-                        socket
-                            .local_addr()
-                            .ok()
-                            .map(|local_addr| (local_addr, socket.clone()))
-                    }))
-                    .collect();
-                udp_socket_buffers = udp_socket_list
-                    .iter()
-                    .map(|(_, socket)| vec![0u8; gro_recv_buf_len(socket.max_gro_segments())])
-                    .collect();
-                udp_recv_futures = udp_socket_list
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, (local_addr, socket))| {
-                        let buf = std::mem::take(&mut udp_socket_buffers[idx]);
-                        create_udp_recv_future(idx, *local_addr, socket.clone(), buf).boxed()
-                    })
-                    .collect();
-                active_socket_count = udp_socket_list.len();
-                consecutive_connection_aborted = vec![0u8; udp_socket_list.len()];
-                let burst_buf_len = udp_socket_list
-                    .iter()
-                    .map(|(_, socket)| gro_recv_buf_len(socket.max_gro_segments()))
-                    .max()
-                    .unwrap_or(UDP_RECV_BUF_LEN);
-                burst_buf.resize(burst_buf_len, 0);
-
-                let is_closed = self.handle_driver_event(evt).await;
-                if is_closed {
-                    trace!("Driver event channel closed, exiting event loop");
-                    return Ok(());
                 }
             }
         }
@@ -1168,7 +1083,7 @@ where
                 // takes effect when the next gathering phase starts.
                 self.pending_ice_configuration = Some((ice_servers, ice_transport_policy));
             }
-            PeerConnectionDriverEvent::IceGathering { .. } => {
+            PeerConnectionDriverEvent::IceGathering => {
                 if let Some((ice_servers, ice_transport_policy)) =
                     self.pending_ice_configuration.take()
                 {
@@ -1603,7 +1518,6 @@ mod tests {
                 turn_relayer,
                 None,
                 HashMap::from([(local_addr, async_socket)]),
-                vec![local_addr],
                 HashMap::new(),
             )
             .await
