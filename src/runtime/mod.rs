@@ -300,8 +300,10 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// many peers learns about per-peer failures through the socket itself, so
     /// `ConnectionRefused` (how an ICMP port-unreachable surfaces on Linux),
     /// `ConnectionReset` (the same on Windows), `Interrupted`, `WouldBlock` and `TimedOut`
-    /// are all treated as transient and do not tear the socket down. Anything else is taken
-    /// to mean the socket is unusable.
+    /// are all treated as transient and do not tear the socket down. `ConnectionAborted` is
+    /// retried with a small per-socket budget because Android can report it while reviving a
+    /// suspended application; exhausting that budget closes the peer connection. Anything
+    /// else is taken to mean the socket is unusable.
     fn poll_recv(
         &self,
         cx: &mut Context<'_>,

@@ -81,6 +81,23 @@ const DEFAULT_TIMEOUT_DURATION: Duration = Duration::from_secs(86400); // 1 day 
 /// by elapsed time catches every shape.
 const MIN_IMMEDIATE_TIMEOUT_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Number of consecutive `ConnectionAborted` receive errors tolerated per UDP socket.
+///
+/// Android may report one or two aborts while reviving a socket after application resume.
+/// Retrying those errors preserves a socket that can still become usable. A third consecutive
+/// abort is treated as terminal so the owning application can rebuild the peer connection
+/// instead of leaving ICE in a silent retry loop.
+const MAX_CONSECUTIVE_CONNECTION_ABORTED_RETRIES: u8 = 2;
+
+fn retry_connection_aborted(consecutive: &mut u8) -> bool {
+    *consecutive = consecutive.saturating_add(1);
+    *consecutive <= MAX_CONSECUTIVE_CONNECTION_ABORTED_RETRIES
+}
+
+fn record_socket_recv_success(consecutive_connection_aborted: &mut u8) {
+    *consecutive_connection_aborted = 0;
+}
+
 /// Insert `sender` for `channel_id`, returning `true` if the channel should be announced.
 pub(crate) fn insert_data_channel_event_sender(
     data_channels: &mut HashMap<RTCDataChannelId, Sender<DataChannelEvent>>,
@@ -236,6 +253,23 @@ where
         self.inner.data_channel_backpressure.notify_waiters();
     }
 
+    /// Close the protocol core and publish its terminal state after an abnormal driver exit.
+    ///
+    /// `signal_stopped` alone prevents blocked sends from hanging, but it does not tell the
+    /// application that the connection must be replaced. Closing the core emits the normal
+    /// `RTCPeerConnectionState::Closed` event through the configured handler, so recovery code
+    /// can rebuild immediately instead of waiting for an outer ICE deadline.
+    pub(crate) async fn signal_io_failure(&mut self) {
+        let close_result = {
+            let mut core = self.inner.core.lock().await;
+            core.close()
+        };
+        if let Err(err) = close_result {
+            error!("Failed to close peer connection after driver I/O failure: {err}");
+        }
+        self.poll_events().await;
+    }
+
     /// Run the driver event loop
     ///
     /// This follows rtc Event Loop pattern exactly with select!
@@ -311,6 +345,7 @@ where
             })
             .collect();
         let mut active_socket_count = udp_socket_list.len();
+        let mut consecutive_connection_aborted = vec![0u8; udp_socket_list.len()];
         // When an already-expired deadline was last handled, so the loop can decline to do it
         // again within the same millisecond. `None` once a deadline lands in the future, so a
         // connection behaving normally never carries state from an earlier stall.
@@ -463,6 +498,9 @@ where
                         match res {
                             Some(SocketRecvResult::Packet { n, stride, local_addr, peer_addr, idx, buf }) => {
                                 trace!("Received {} bytes from {} to {}", n, peer_addr, local_addr);
+                                record_socket_recv_success(
+                                    &mut consecutive_connection_aborted[idx],
+                                );
 
                                 // A single recv may return several GRO-coalesced
                                 // datagrams; split `buf[..n]` back into individual
@@ -506,6 +544,35 @@ where
                                 }
                             }
                             Some(SocketRecvResult::Error { err, local_addr, idx, buf }) => {
+                                if err.kind() == std::io::ErrorKind::ConnectionAborted {
+                                    let should_retry = retry_connection_aborted(
+                                        &mut consecutive_connection_aborted[idx],
+                                    );
+                                    if should_retry {
+                                        warn!(
+                                            "ConnectionAborted on UDP socket {} (attempt {}/{}); retaining socket and retrying recv",
+                                            local_addr,
+                                            consecutive_connection_aborted[idx],
+                                            MAX_CONSECUTIVE_CONNECTION_ABORTED_RETRIES,
+                                        );
+
+                                        let (socket_local_addr, socket) = &udp_socket_list[idx];
+                                        udp_recv_futures.push(
+                                            create_udp_recv_future(idx, *socket_local_addr, socket.clone(), buf).boxed()
+                                        );
+                                        continue;
+                                    }
+
+                                    error!(
+                                        "UDP socket {} returned ConnectionAborted {} consecutive times; closing peer connection",
+                                        local_addr,
+                                        consecutive_connection_aborted[idx],
+                                    );
+                                    return Err(Error::Other(format!(
+                                        "UDP socket {local_addr} remained aborted after {MAX_CONSECUTIVE_CONNECTION_ABORTED_RETRIES} receive retries"
+                                    )));
+                                }
+
                                 if is_retryable_socket_recv_error(&err) {
                                     trace!("Transient socket recv error on {}: {}", local_addr, err);
 
@@ -587,6 +654,7 @@ where
                     })
                     .collect();
                 active_socket_count = udp_socket_list.len();
+                consecutive_connection_aborted = vec![0u8; udp_socket_list.len()];
                 let burst_buf_len = udp_socket_list
                     .iter()
                     .map(|(_, socket)| gro_recv_buf_len(socket.max_gro_segments()))
@@ -601,6 +669,13 @@ where
                 }
             }
         }
+    }
+
+    fn is_missing_udp_socket(&self, transport: &TransportContext) -> bool {
+        transport.transport_protocol == TransportProtocol::UDP
+            && transport.peer_addr.port() != MDNS_PORT
+            && !self.turn_relayer.contains_local_addr(transport.local_addr)
+            && !self.udp_sockets.contains_key(&transport.local_addr)
     }
 
     async fn handle_write(&mut self, msg: TaggedBytesMut) -> Result<usize> {
@@ -631,10 +706,13 @@ where
                 .await?)
         } else {
             warn!(
-                "None tcp/udp socket, drop the packet to {:?} from {:?} for {:?}",
+                "None tcp/udp socket for packet to {:?} from {:?} for {:?}",
                 msg.transport.peer_addr, msg.transport.local_addr, msg.transport.transport_protocol
             );
-            Ok(0)
+            Err(Error::Other(format!(
+                "no UDP socket bound for local address {} while writing to {}",
+                msg.transport.local_addr, msg.transport.peer_addr
+            )))
         }
     }
 
@@ -1223,6 +1301,7 @@ where
         // 1.a stun_gatherer poll_write()
         while let Some(msg) = self.stun_gatherer.poll_write() {
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
+            let missing_udp_socket = self.is_missing_udp_socket(&msg.transport);
             if let Err(err) = self.handle_write(msg).await {
                 error!(
                     "Failed to write packet to {:?} from {:?}: {}",
@@ -1237,12 +1316,16 @@ where
                         four_tuple.peer_addr, four_tuple.local_addr, err
                     );
                 }
+                if missing_udp_socket {
+                    return Err(err);
+                }
             }
         }
 
         // 1.b turn_relayer poll_write()
         while let Some(msg) = self.turn_relayer.poll_write() {
             let four_tuple: FourTuple = FourTuple::from(&msg.transport);
+            let missing_udp_socket = self.is_missing_udp_socket(&msg.transport);
             if let Err(err) = self.handle_write(msg).await {
                 error!(
                     "Failed to write packet to {:?} from {:?}: {}",
@@ -1257,13 +1340,16 @@ where
                         four_tuple.peer_addr, four_tuple.local_addr, err
                     );
                 }
+                if missing_udp_socket {
+                    return Err(err);
+                }
             }
         }
 
         // 1.c peer_connection poll_write() - Send all outgoing packets, coalescing
         // consecutive same-destination datagrams into single UDP GSO syscalls.
         let writes = Self::drain_core_writes(self.inner.clone()).await;
-        self.flush_writes(writes).await;
+        self.flush_writes(writes).await?;
 
         Ok(())
     }
@@ -1281,7 +1367,7 @@ where
     /// [`MAX_GSO_BATCH_BYTES`]. Everything the GSO path can't own — TCP, mDNS,
     /// TURN-relayed, or datagrams for an unknown socket — falls back to the
     /// per-packet [`handle_write`](Self::handle_write) path unchanged.
-    async fn flush_writes(&mut self, mut writes: Vec<TaggedBytesMut>) {
+    async fn flush_writes(&mut self, mut writes: Vec<TaggedBytesMut>) -> Result<()> {
         // Borrow the reusable concat buffer out of `self` so the sends below don't
         // hold a `&self` borrow across `.await`.
         let mut scratch = std::mem::take(&mut self.gso_scratch);
@@ -1306,12 +1392,18 @@ where
                     transport: writes[i].transport,
                     message: std::mem::take(&mut writes[i].message),
                 };
+                let missing_udp_socket = self.is_missing_udp_socket(&msg.transport);
                 let four_tuple: FourTuple = FourTuple::from(&msg.transport);
                 if let Err(err) = self.handle_write(msg).await {
                     error!(
                         "Failed to write packet to {:?} from {:?}: {}",
                         four_tuple.peer_addr, four_tuple.local_addr, err
                     );
+                    if missing_udp_socket {
+                        scratch.clear();
+                        self.gso_scratch = scratch;
+                        return Err(err);
+                    }
                 }
                 i += 1;
                 continue;
@@ -1396,6 +1488,7 @@ where
 
         scratch.clear();
         self.gso_scratch = scratch;
+        Ok(())
     }
 
     async fn poll_events(&mut self) {
@@ -1464,7 +1557,81 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::channel;
+    use crate::peer_connection::tests::new_test_peer_connection;
+    use crate::runtime::{channel, default_runtime};
+
+    #[test]
+    fn connection_aborted_retry_budget_is_bounded_and_resets_after_success() {
+        let mut consecutive = 0;
+
+        assert!(retry_connection_aborted(&mut consecutive));
+        assert!(retry_connection_aborted(&mut consecutive));
+        assert!(!retry_connection_aborted(&mut consecutive));
+
+        record_socket_recv_success(&mut consecutive);
+        assert_eq!(consecutive, 0);
+        assert!(retry_connection_aborted(&mut consecutive));
+        assert!(retry_connection_aborted(&mut consecutive));
+        assert!(!retry_connection_aborted(&mut consecutive));
+    }
+
+    #[test]
+    fn missing_udp_socket_write_returns_explicit_error() {
+        let runtime = default_runtime().expect("test requires a runtime feature");
+        runtime.block_on(Box::pin(async {
+            let (inner, _driver_event_rx) = new_test_peer_connection().await;
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let local_addr = socket.local_addr().unwrap();
+            let async_socket = inner.runtime.wrap_udp_socket(socket).unwrap();
+            let local_addrs = vec![local_addr];
+            let stun_gatherer = RTCStunGatherer::new(
+                local_addrs.clone(),
+                Vec::new(),
+                RTCIceTransportPolicy::All,
+                inner.runtime.clone(),
+            );
+            let turn_relayer = RTCTurnRelayer::new(
+                local_addrs,
+                Vec::new(),
+                RTCIceTransportPolicy::All,
+                inner.runtime.clone(),
+            );
+            let mut driver = PeerConnectionDriver::new(
+                inner,
+                stun_gatherer,
+                turn_relayer,
+                None,
+                HashMap::from([(local_addr, async_socket)]),
+                vec![local_addr],
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+            driver.udp_sockets.clear();
+            let peer_addr = "127.0.0.1:9".parse().unwrap();
+            let err = driver
+                .handle_write(TaggedBytesMut {
+                    now: Instant::now(),
+                    transport: TransportContext {
+                        local_addr,
+                        peer_addr,
+                        ecn: None,
+                        transport_protocol: TransportProtocol::UDP,
+                    },
+                    message: BytesMut::from(&b"probe"[..]),
+                })
+                .await
+                .expect_err("missing UDP socket must be surfaced to the driver");
+
+            assert!(
+                err.to_string()
+                    .contains("no UDP socket bound for local address"),
+                "unexpected error: {err}"
+            );
+        }));
+    }
 
     #[test]
     fn insert_data_channel_event_sender_replaces_closed_sender() {

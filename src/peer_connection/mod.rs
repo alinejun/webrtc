@@ -844,6 +844,7 @@ where
 
             if let Err(e) = driver.event_loop(driver_event_rx).await {
                 error!("I/O error: {}", e);
+                driver.signal_io_failure().await;
             }
             // The driver has stopped for good (clean shutdown OR an abnormal error exit).
             // Mark closing and wake any sender parked in send back-pressure, so a blocking
@@ -1340,6 +1341,8 @@ mod tests {
             write_pending: AtomicBool::new(false),
             write_backpressure: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
+            fresh_udp_sockets_on_ice_restart: false,
+            udp_socket_rebind_pending: AtomicBool::new(false),
             data_channel_send_buffer_limit: usize::MAX,
             data_channel_backpressure: crate::runtime::Notify::new(),
             data_channel_events_tx: Mutex::new(HashMap::new()),
